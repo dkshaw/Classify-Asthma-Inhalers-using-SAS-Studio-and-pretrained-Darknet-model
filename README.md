@@ -13,6 +13,3 @@ Custom code was added to visualize a false negative prediction and an acurrate p
 ![Image 1](ViewCVModelExplainabilityInSASStudio.jpg)
 
 The intent of this demo is to show how SAS computer vision offers the promise of higher level of quality control accuracy, that remains consistent and unbiased, with the ability to scale as production throughput increases.
-
-**EEC 171:**
-To deliver this demo, reserve the EEC171 RACE image, which contains the VA report, SAS Studio code, and ESP models shown in demo videos.
