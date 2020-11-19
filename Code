@@ -1,0 +1,315 @@
+/* Code created for Tech Connect 2020 which was postponed due to COVID-19 */
+/* DO NOT TRY TO RUN THIS CODE WITHOUT AN ENVIRONMENT WITH GPUS */
+/* Code provided as EXAMPLE ONLY */
+
+/* Start a SAS Viya CAS session */
+libname mycas cas;
+
+/* Load required CAS actions and data into a CASLIB */
+proc cas ;
+  loadactionset 'deeplearn';
+  loadactionset 'image';
+  loadactionset 'table';
+  table.addcaslib / name='inhaler_pred' path='/opt/sasinside/DemoData/CV' subdirectories=true;
+  image.loadimages / caslib='inhaler_pred' path='Images' recurse=true labellevels=1 casout={name='TrainData', replace=true};
+quit;
+
+/* Resize images to 224 x 224 */
+proc cas;
+  processImages / casout={name='Train_data', replace=1} imageTable={name='TrainData'}
+  imageFunctions ={{functionOptions={functionType='RESIZE', height=224, width=224 }}};
+quit;
+
+/* Partition data into training and validation data */
+proc partition data=mycas.Train_data samppct=80 samppct2=20 seed=12345 partind;
+  by _label_;
+  output out=mycas.Train_P;
+run;
+
+/* Shuffle data */
+proc cas;
+  table.shuffle / table={name='Train_P', computedVars={{name="HMapID"}}, computedVarsProgram="length HMapID $60; HMapID=scan(_path_,-1,'/');"} casout={name="Train_PS", replace=1};
+quit;
+
+/* Check frequency of partition and augmented data */
+proc freq data=mycas.train_ps;
+  tables _label_*_partind_;
+run;
+
+/* View images */
+data _null_;
+  set mycas.train_ps;
+  by _label_;
+  if first._label_ then do;
+    if _n_=1 then do;
+			dcl odsout obj();
+			obj.layout_gridded(columns:8);
+	end;
+    obj.region();
+    obj.format_text(text: _label_, just: "c", style_attr: 'font_size=10pt');
+    obj.image(file: _path_, width: "224", height: "224");
+    if eof then do;
+			obj.layout_end();
+	end;
+  end;
+run;
+
+/* Load Model Architecture and Pre-trained Weights for Darknet model */
+proc casutil;  
+  load file="/opt/sasinside/DemoData/CV/Darknet.sashdat" casout="Darknet" importoptions=(filetype="hdat") replace;
+  load file="/opt/sasinside/DemoData/CV/Darknet_weights.sashdat" casout="Darknet_weights" importoptions=(filetype="hdat") replace;
+quit;
+
+/* Modify Darknet model architecture for better prediction performance */
+proc cas;
+  removelayer / model='Darknet' name='output1';  /*Remove the last (output) layer from the Model Architecture */
+  AddLayer / model='Darknet' name='outlayer' layer={type='output' act='SOFTMAX'} srcLayers={'pool12'};
+quit;
+
+/* Surgically Modify Pretrained Model */
+proc cas;
+  mytbl.name  ="Darknet"; 
+  mytbl.where = "_DLKey0_ = 'input1' and _DLChrVal_='dropout'";
+  table.update / table=mytbl set = {{var="_DLNumVal_", value="0.000001"}}; /* Change dropout rate */
+  mytbl.where = "'input1' = _DLKey0_ and 'inputopts.flip' = _DLKey1_";
+  table.update / table=mytbl set = {{var="_DLNumVal_", value="2"}}; /* Add Random Horizontal Flip */
+  mytbl.where = "'input1' = _DLKey0_ and 'inputopts.mutation' = _DLKey1_";
+  table.update / table=mytbl set = {{var="_DLNumVal_", value="3"}}; /* Add Random Mutation */
+quit;
+
+/* Run DL Tuner to improve Darknet model hyperparameters using fixed learningrate, gamma and dropout */
+ods pdf file="/opt/sasinside/DemoData/TechConnect2020/TunerOutput_Darknet.pdf";
+proc cas;
+	dlTune / table={name='Train_PS', where='_PartInd_=1'} model='Darknet' 
+        modelWeights={name='TunerWeights_D', replace=1}
+        bestweights={name='TunerBest_D', replace=1}
+	    initWeights='Darknet_weights'
+        GPU=False /* update to True when you have an image with GPUs */
+        inputs='_image_' 
+        target='_label_' nominal={'_label_'}
+
+forceEqualPadding = True
+ ValidTable={name='Train_PS', where='_PartInd_=2'} 
+  optimizer = {miniBatchSize=80, ignoreTrainingError=true, MAXEPOCHS=60, numTrials=175, tuneRetention=0.50, TUNEITER=1, tuneRestarts=0, regL1={lowerBound=.000001 upperBound=.003}, regL2={lowerBound=.000001 upperBound=.003},
+			   algorithm={method='LARS', lrpolicy='Step', momentum={lowerBound=.1 upperBound=.99},gamma=0.88854, 
+						stepsize=6, learningrate=0.000563774, scalefactor=.009, warmup=5, clipgradmin=-100,clipgradmax=100} 
+						dropout=0.04140586, dropoutInput=0};
+quit;
+ods pdf close; 
+
+/* Modify updated Darknet model DLTuner best configurations */
+proc cas;
+  mytbl.name  ="Darknet"; 
+  mytbl.where = "'dropout' = _DLChrVal_";
+  table.update / table=mytbl set = {{var="_DLNumVal_", value="0.04140586"}};
+
+  mytbl.where = "_DLKey0_ = 'input1' and _DLChrVal_='dropout'";
+  table.update / table=mytbl set = {{var="_DLNumVal_", value="0"}};
+
+  mytbl.where = "'input1' = _DLKey0_ and 'No flipping' = _DLChrVal_";
+  table.update / table=mytbl set = {{var="_DLNumVal_", value="2"}};
+
+  mytbl.where = "'input1' = _DLKey0_ and 'inputopts.mutation' = _DLKey1_";
+  table.update / table=mytbl set = {{var="_DLNumVal_", value="3"}};
+quit;
+
+/* Import best Tuner Weights */
+ods output OptIterHistory=ObjectModeliter;
+proc cas;
+	dlTrain / table={name='Train_PS', where='_PartInd_=1'} model='Darknet' 
+        initWeights='Darknet_weights'
+		modelWeights={name='ConVTrainedWeights_d', replace=1}
+        bestweights={name='bestweights_SaveLives', replace=1}
+        inputs='_image_' 
+        target='_label_' nominal={'_label_'}
+        GPU=False /* update to True when you have an image with GPUs */
+        ValidTable={name='Train_PS', where='_PartInd_=2'} 
+        optimizer={minibatchsize=3, algorithm={method='LARS', momentum=0.9366, lrpolicy='Step', gamma=0.9217666667, stepsize=6, 
+				   learningrate=0.0006332967, scalefactor=.009, warmup=5}, regL1=0.0009863857, regL2=0.0003523114, maxepochs=60} seed=12345;
+quit;
+
+/*  Store minimum training and validation error in macro variables */
+proc sql noprint;
+	select min(FitError)
+	into :Train separated by ' '
+	from ObjectModeliter;
+quit;
+
+proc sql noprint; 
+	select min(ValidError)
+ 	into :Valid separated by ' ' 
+	from ObjectModeliter; 
+quit; 
+
+/* Plot Performance */
+title "Training/Validation Loss vs Epochs";
+proc sgplot data=ObjectModeliter;
+yaxis label='Misclassification Rate' max=.9 min=0;
+                series x=Epoch y=FitError / name="plot1" curvelabelpos=end legendlabel="Training Fit Loss" curvelabel="&Train";
+                series x=Epoch y=ValidError / name="plot2" curvelabelpos=end legendlabel="Validation Loss" curvelabel="&Valid";
+                keylegend  "plot1" "plot2" / location=inside position=topright;
+run;
+title;
+
+/* Score new data using the trained model */
+proc cas;
+	dlScore / table={name='Train_PS', where='_PartInd_=2'} model='Darknet' 
+			  initWeights='bestweights_SaveLives' 
+			  casout={name='ScoredData', replace=1}
+			  copyVars={'_label_','_image_','HMapID','_PartInd_'}
+			  encodename=true gpu=False /* update to True when you have an image with GPUs */;
+quit;
+
+/* Create misclassification counts */
+data work.counts;
+set mycas.ScoredData;
+by _label_;
+count + 1;
+Misclassified_count=0;
+format group $21.;
+if first._label_ then do;
+  count = 1;
+end;
+
+if trim(left(_label_)) = trim(left(I__label_)) then Misclassified_count=0;
+else Misclassified_count=Misclassified_count + 1;
+
+if trim(left(_label_)) =: "NonDefect" and trim(left(I__label_)) =: "Defect" then group="False Positive";
+else if trim(left(_label_)) =: "Defect" and trim(left(I__label_)) =: "NonDefect" then group="False Negative";
+else group="Acceptable Prediction";
+run;
+
+ods graphics / reset width=6.4in height=4.8in imagemap;
+proc sgplot data=work.counts;
+	title height=14pt "Predict Defective Inhalers";
+	vbar _label_ / group=group groupdisplay=cluster datalabel fillType=gradient 
+		stat=percent;
+	xaxis discreteorder=unformatted label="Misclassification Error";
+	yaxis grid;
+run;
+ods graphics / reset;
+title;
+
+/* create macro to visualize computer vision predictions */
+%macro image_panels(data, image_name, group, image_id="__NONE__");
+
+/* Capture name for predicted outcomes */
+proc cas;
+    image.augmentImages /*result=test*/ / 
+        table={name="SCOREDDATA", where="HMapID in(""&group"")", computedVars={{name="_Original_P_"}}, 
+	    computedVarsProgram="length _Original_P_ 8; _Original_P_=P__label_Defect;"},
+        cropList={{x=0, y=0, width=56,  height=56, stepSize=2, outputWidth=224, outputHeight=224, 
+                   sweepImage=TRUE, mask=TRUE}},
+        casOut={name='_tempMaskedImages_', replace=TRUE} copyVars={'HMapID','_Original_P_'}; 
+quit;
+
+proc cas;
+   processImages / casout={name='_tempMaskedImages2_', replace=1} 
+   copyVars={'HMapID','_Original_P_','x','y','width','height'}
+   imageTable={name='_tempMaskedImages_'}
+   imageFunctions ={
+      {functionOptions={functionType='RESIZE', height=224, width=224}}};
+quit;
+
+/* Score Original data */
+proc cas;
+    dlScore / table={name="_tempMaskedImages2_"} model='Darknet' 
+              initWeights='bestweights_SaveLives'
+              casout={name='_NSD_', replace=1}
+              copyVars={'HMapID','_Original_P_','x','y','width','height'} 
+              gpu=False /* update to True when you have an image with GPUs */
+			  encodename=true;
+quit;
+
+proc cas;
+ table.shuffle / table={name='_NSD_',computedVars={{name="difference"}},
+ 					    computedVarsProgram="length difference 8; difference=abs(_Original_P_-P__label_Defect);"},
+ 			  	 casout={name='_NSD_Diff_', replace=true};
+quit;
+
+proc template;
+define statgraph imagevision;
+begingraph;
+layout lattice / columns=3 columngutter=5px;
+   cell;
+     cellheader;
+        entry "Original Image" / textattrs=GraphTitleText;
+     endcellheader;
+     layout overlay / xaxisopts=(display=none offsetmin=0 offsetmax=0)
+                      yaxisopts=(display=none offsetmin=0 offsetmax=0) walldisplay=none;
+        drawimage "&image_name" / yspace=wallpercent
+                  xspace=wallpercent height=100 width=100 x=50 y=50;
+        heatmap x=x y=y / name='HeatMap' colormodel=(white lightblue blue)
+                    colorresponse=difference colorstat=mean xbinsize=2 ybinsize=2 datatransparency=1;
+     endlayout;
+   endcell;
+   cell;
+     cellheader;
+        entry "Overlaid Image" / textattrs=GraphTitleText;
+     endcellheader;
+     layout overlay / xaxisopts=(display=none offsetmin=0 offsetmax=0)
+                      yaxisopts=(display=none offsetmin=0 offsetmax=0) walldisplay=none;
+        drawimage "&image_name" / yspace=wallpercent layer=back
+                  xspace=wallpercent height=100 width=100 x=50 y=50;
+        heatmap x=x y=y / name='HeatMap' colormodel=(white lightblue blue)
+                    colorresponse=difference colorstat=mean xbinsize=2 ybinsize=2 datatransparency=0.5;
+     endlayout;
+   endcell;
+   cell;
+     cellheader;
+        entry "Heat Map" / textattrs=GraphTitleText;
+     endcellheader;
+     layout overlay / xaxisopts=(display=none offsetmin=0)
+                      yaxisopts=(display=none offsetmin=0 offsetmax=0) walldisplay=none;
+        heatmap x=x y=y / name='HeatMap' colormodel=(white lightblue blue)
+                    colorresponse=difference colorstat=mean  xbinsize=2 ybinsize=2;
+     endlayout;
+   endcell;
+   sidebar / align=right;
+       continuouslegend "HeatMap" / title="Weighting";
+   endsidebar;
+endlayout;
+endgraph;
+end;
+run;
+
+ods graphics / width=900 height=300;
+proc sgrender data=&data template=imagevision;
+%if &image_id ne "__NONE__" %then %do;
+where MapID = "&image_id";
+%end;
+run;
+%mend;
+
+/* Select a False Negative prediction to visualize the computer vision model */
+proc sql noprint;
+select max(HMapID), trim(_label_) into :fn_p, :fn_folder
+from work.counts
+where group="False Negative"
+group by HMapID;
+quit;
+%let fn_p = %trim(&fn_p);
+%let fn_folder = %trim(&fn_folder);
+%put &fn_p &fn_folder;
+
+/* Select an Accurate Prediction of a known defective inhaler to visualize */
+proc sql noprint;
+select max(HMapID) as image, trim(_label_) into :a_p, :a_folder
+from work.counts
+where group="Acceptable Prediction" and substr(_label_,1,6) ='Defect'
+group by HMapID;
+quit;
+%let a_p = %trim(&a_p);
+%let a_folder = %trim(&a_folder);
+%put &a_p &a_folder;
+
+/* Visualize computer vision model for a False Negative prediction */
+title "Visualize False Positive Computer Vision Prediction";
+%image_panels(mycas._NSD_Diff_, /opt/sasinside/DemoData/TechConnect2020/Images/&fn_folder/&fn_p, &fn_p);
+
+/* Visualize computer vision model for an Accurate Prediction */
+title "Visualize Accurate Computer Vision Prediction";
+%image_panels(mycas._NSD_Diff_, /opt/sasinside/DemoData/TechConnect2020/Images/&a_folder/&a_p, &a_p);
+
+/* Terminate the SAS Viya CAS session */
+cas _all_ terminate;
